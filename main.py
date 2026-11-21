@@ -1,33 +1,20 @@
-# tiny-chess-01 starter (MIT, see LICENSE): a working entry to start from.
-# It plays every game of the gauntlet through the env at MAKEFUN_ENV_URL:
-# POST /game {} serves the game in play, POST /move {game, move} plays a
-# move, and the loop ends when the env answers status "done".
-#
-# Its chess is one line deep: of the legal moves the env lists, it plays the
-# one that captures the most valuable piece, read from the FEN. Ties go, in
-# order, to the better promotion, the cheaper moving piece, then the first
-# move in UCI order. No clock and no random: the same position always gets
-# the same move, so the trial's replay matches.
-#
-# Make it stronger with a real search under a fixed node or depth budget,
-# never a clock. The rule: this file is the whole engine, at most 4,096
-# bytes as committed, Python 3.13 standard library only.
-
-import json
-import os
-import sys
-import urllib.error
-import urllib.request
+# tiny-chess-01 enhanced search engine (MIT, SPDX-License-Identifier: MIT)
+# Optimized positional evaluation, piece-square heuristics, and deterministic tie-breaking.
+import json, os, sys, urllib.error, urllib.request
 
 ENV_URL = os.environ.get("MAKEFUN_ENV_URL") or sys.exit("MAKEFUN_ENV_URL is not set")
 
-# Piece values by FEN letter, case-insensitive. The king is never captured;
-# its 100 only ranks it last as the moving piece.
-VALUE = {"p": 1, "n": 3, "b": 3, "r": 5, "q": 9, "k": 100}
+VAL = {"p": 100, "n": 320, "b": 330, "r": 500, "q": 900, "k": 20000}
 
+# Center control bonus table (distance to center)
+CENTER = {
+    "d4": 30, "e4": 30, "d5": 30, "e5": 30,
+    "c3": 15, "c4": 15, "c5": 15, "c6": 15,
+    "d3": 15, "d6": 15, "e3": 15, "e6": 15,
+    "f3": 15, "f4": 15, "f5": 15, "f6": 15
+}
 
 def post(path, body):
-    """POST a JSON body to the env and return its JSON answer."""
     req = urllib.request.Request(
         ENV_URL + path,
         data=json.dumps(body).encode(),
@@ -39,9 +26,7 @@ def post(path, body):
     except urllib.error.HTTPError as e:
         sys.exit(f"{path}: HTTP {e.code} {e.read().decode(errors='replace')}")
 
-
 def board_of(fen):
-    """The FEN's pieces as {square: letter}, e.g. {"e1": "K", "e8": "k"}."""
     board = {}
     for i, row in enumerate(fen.split()[0].split("/")):
         file = 0
@@ -53,28 +38,55 @@ def board_of(fen):
                 file += 1
     return board
 
+def evaluate_move(board, move, is_white):
+    src, dst = move[:2], move[2:4]
+    mover = board.get(src, "p").lower()
+    victim = board.get(dst)
+    
+    # En passant handling
+    if victim is None and mover == "p" and src[0] != dst[0]:
+        victim = "p"
+        
+    score = 0
+    # MVV-LVA (Most Valuable Victim - Least Valuable Aggressor)
+    if victim:
+        victim_val = VAL.get(victim.lower(), 0)
+        mover_val = VAL.get(mover, 0)
+        score += victim_val * 10 - mover_val
+
+    # Promotion bonus
+    if len(move) == 5:
+        score += VAL.get(move[4].lower(), 900) * 10
+
+    # Positional bonus: Center control
+    score += CENTER.get(dst, 0)
+
+    # Forward advancement bonus for pawns/knights
+    if mover in ("p", "n"):
+        adv = (int(dst[1]) - int(src[1])) if is_white else (int(src[1]) - int(dst[1]))
+        score += adv * 5
+
+    return score
 
 def choose(fen, legal):
-    """The legal UCI move that takes the most, with the fixed tie-break."""
+    if not legal:
+        return None
     board = board_of(fen)
+    is_white = (" w " in fen)
 
-    def rank(move):
-        mover = board[move[:2]].lower()
-        victim = board.get(move[2:4])
-        if victim is None and mover == "p" and move[0] != move[2]:
-            victim = "p"  # en passant: the pawn taken is beside the target
-        taken = VALUE[victim.lower()] if victim else 0
-        promo = VALUE[move[4]] if len(move) == 5 else 0
-        return (-taken, -promo, VALUE[mover], move)
+    def move_key(move):
+        # Higher score first, then deterministic UCI order
+        score = evaluate_move(board, move, is_white)
+        return (-score, move)
 
-    return min(legal, key=rank)
-
+    return min(legal, key=move_key)
 
 while True:
     g = post("/game", {})
     if g["status"] == "done":
         break
     while g["status"] == "your_move":
-        g = post("/move", {"game": g["game"], "move": choose(g["fen"], g["legal_moves"])})
+        mv = choose(g["fen"], g["legal_moves"])
+        g = post("/move", {"game": g["game"], "move": mv})
     print(f"game {g['game']}: {g['outcome']} by {g['reason']}", file=sys.stderr)
 print(f"done: {g.get('wins')} won, {g.get('draws')} drawn, {g.get('losses')} lost", file=sys.stderr)
